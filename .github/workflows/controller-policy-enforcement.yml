@@ -24,7 +24,14 @@ jobs:
           sudo mn -c
 
           python3 -m venv /tmp/p5-osken
-          /tmp/p5-osken/bin/pip install os-ken==4.2.2
+          /tmp/p5-osken/bin/pip install os-ken==3.1.1
+          echo "=== OS-KEN EXECUTABLE CHECK ==="
+
+          ls -l /tmp/p5-osken/bin/osken-manager
+          
+          /tmp/p5-osken/bin/osken-manager --help > /tmp/osken-help.txt
+          
+          echo "OS-KEN MANAGER: AVAILABLE"
 
           
           /tmp/p5-osken/bin/python - <<'PY'
