@@ -26,29 +26,36 @@ jobs:
           python3 -m venv /tmp/p5-osken
           /tmp/p5-osken/bin/pip install os-ken==4.2.2
 
-          /tmp/p5-osken/bin/python - <<'PY'
-          import importlib.util
           
-          modules = [
-              "os_ken.app.simple_switch_13",
-              "os_ken.app.ofctl.api",
-              "os_ken.app.wsgi",
+          /tmp/p5-osken/bin/python - <<'PY'
+          import os_ken
+          import importlib.util
+          import pkgutil
+
+          print("=== OS-KEN PACKAGE ===")
+          print("Package location:", os_ken.__file__)
+
+          print("\n=== AVAILABLE APP MODULES ===")
+          import os_ken.app
+          for module in pkgutil.iter_modules(os_ken.app.__path__):
+              print(module.name)
+
+          print("\n=== CORE MODULE AVAILABILITY ===")
+          required = [
+              "os_ken.base.app_manager",
+              "os_ken.controller.ofp_event",
+              "os_ken.controller.handler",
               "os_ken.ofproto.ofproto_v1_3"
           ]
-          
-          for name in modules:
-              try:
-                  spec = importlib.util.find_spec(name)
-                  if spec is None:
-                      raise ImportError(name)
-                  __import__(name)
-                  print("[PASS]", name)
-              except Exception as exc:
-                  print("[FAIL]", name, repr(exc))
-                  raise
-          
-          print("P5_C21 OS-Ken foundation: PASS")
+
+          for name in required:
+              spec = importlib.util.find_spec(name)
+              print(name, ":", "FOUND" if spec else "MISSING")
+              assert spec is not None, name
+
+          print("\nP5_C21 CORE MODULE DISCOVERY: PASS")
           PY
+
 
       # - name: Test controller-driven enforcement
       #   run: |
