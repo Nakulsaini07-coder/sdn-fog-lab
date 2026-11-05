@@ -57,6 +57,215 @@ jobs:
           PY
 
 
+        
+      - name: Test custom OS-Ken controller
+        run: |
+          cat > /tmp/p5_custom_controller.py <<'PY'
+          from os_ken.base import app_manager
+          from os_ken.controller import ofp_event
+          from os_ken.controller.handler import (
+              CONFIG_DISPATCHER, MAIN_DISPATCHER, set_ev_cls
+          )
+          from os_ken.ofproto import ofproto_v1_3
+
+          class P5CustomController(app_manager.OSKenApp):
+              OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
+
+              @set_ev_cls(
+                  ofp_event.EventOFPSwitchFeatures,
+                  CONFIG_DISPATCHER
+              )
+              def switch_features(self, ev):
+                  dp = ev.msg.datapath
+                  ofp = dp.ofproto
+                  parser = dp.ofproto_parser
+
+                  match = parser.OFPMatch()
+                  actions = [
+                      parser.OFPActionOutput(
+                          ofp.OFPP_CONTROLLER,
+                          ofp.OFPCML_NO_BUFFER
+                      )
+                  ]
+                  instructions = [
+                      parser.OFPInstructionActions(
+                          ofp.OFPIT_APPLY_ACTIONS, actions
+                      )
+                  ]
+
+                  flow = parser.OFPFlowMod(
+                      datapath=dp,
+                      priority=0,
+                      match=match,
+                      instructions=instructions
+                  )
+                  dp.send_msg(flow)
+
+                  self.logger.info(
+                      "P5_CUSTOM_CONTROLLER: SWITCH_CONNECTED dpid=%s",
+                      dp.id
+                  )
+
+              @set_ev_cls(
+                  ofp_event.EventOFPPacketIn,
+                  MAIN_DISPATCHER
+              )
+              def packet_in(self, ev):
+                  msg = ev.msg
+                  dp = msg.datapath
+                  ofp = dp.ofproto
+                  parser = dp.ofproto_parser
+
+                  in_port = msg.match["in_port"]
+                  actions = [
+                      parser.OFPActionOutput(ofp.OFPP_FLOOD)
+                  ]
+
+                  packet_out = parser.OFPPacketOut(
+                      datapath=dp,
+                      buffer_id=ofp.OFP_NO_BUFFER,
+                      in_port=in_port,
+                      actions=actions,
+                      data=msg.data
+                  )
+                  dp.send_msg(packet_out)
+          PY
+
+          sudo python3 - <<'PY'
+          import subprocess
+          import time
+          import re
+
+          from mininet.net import Mininet
+          from mininet.node import OVSSwitch, RemoteController
+          from mininet.log import setLogLevel
+
+          setLogLevel("warning")
+          process = None
+          net = None
+
+          try:
+              with open("/tmp/p5-controller.log", "w") as log:
+                  process = subprocess.Popen(
+                      [
+                          "/tmp/p5-osken/bin/osken-manager",
+                          "--ofp-listen-host", "127.0.0.1",
+                          "--ofp-tcp-listen-port", "6653",
+                          "/tmp/p5_custom_controller.py"
+                      ],
+                      stdout=log,
+                      stderr=subprocess.STDOUT
+                  )
+
+                  time.sleep(3)
+                  if process.poll() is not None:
+                      raise RuntimeError(
+                          "Custom OS-Ken controller exited early"
+                      )
+
+                  net = Mininet(
+                      controller=None,
+                      switch=OVSSwitch,
+                      autoSetMacs=True,
+                      build=False
+                  )
+
+                  net.addController(
+                      "c0",
+                      controller=RemoteController,
+                      ip="127.0.0.1",
+                      port=6653
+                  )
+
+                  h1 = net.addHost("h1", ip="10.0.0.1/24")
+                  h2 = net.addHost("h2", ip="10.0.0.2/24")
+
+                  s1 = net.addSwitch(
+                      "s1",
+                      protocols="OpenFlow13",
+                      failMode="secure",
+                      dpid="0000000000000001"
+                  )
+
+                  net.addLink(h1, s1)
+                  net.addLink(h2, s1)
+                  net.build()
+                  net.start()
+
+                  time.sleep(2)
+
+                  status = subprocess.check_output(
+                      [
+                          "ovs-vsctl",
+                          "--columns=is_connected",
+                          "list", "Controller"
+                      ],
+                      text=True
+                  )
+
+                  assert re.search(
+                      r"is_connected\s*:\s*true", status
+                  ), "Controller is not connected"
+
+                  print(
+                      "[PASS] Custom controller connected",
+                      flush=True
+                  )
+
+                  flows = subprocess.check_output(
+                      [
+                          "ovs-ofctl", "-O", "OpenFlow13",
+                          "dump-flows", "s1"
+                      ],
+                      text=True
+                  )
+
+                  print(flows, flush=True)
+
+                  assert "actions=CONTROLLER" in flows, (
+                      "Table-miss controller rule missing"
+                  )
+
+                  print(
+                      "[PASS] Table-miss rule installed",
+                      flush=True
+                  )
+
+                  print(
+                      "\n=== CUSTOM CONTROLLER PING TEST ===",
+                      flush=True
+                  )
+
+                  loss = net.pingAll(timeout="2")
+                  print(
+                      f"Packet loss: {loss}%",
+                      flush=True
+                  )
+
+                  assert loss == 0.0, (
+                      f"Forwarding failed: {loss}% packet loss"
+                  )
+
+                  print("\nP5_C21B RESULTS", flush=True)
+                  print("Custom controller : PASS", flush=True)
+                  print("OpenFlow 1.3      : PASS", flush=True)
+                  print("Packet forwarding : PASS", flush=True)
+
+          finally:
+              if net is not None:
+                  net.stop()
+
+              if process is not None:
+                  process.terminate()
+                  try:
+                      process.wait(timeout=5)
+                  except subprocess.TimeoutExpired:
+                      process.kill()
+                      process.wait()
+          PY
+
+
+
       # - name: Test controller-driven enforcement
       #   run: |
       #     sudo python3 - <<'PY'
