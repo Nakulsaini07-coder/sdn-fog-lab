@@ -1,0 +1,71 @@
+
+name: Phase 5 - Free SDN Host Readiness
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sdn-readiness:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Check Ubuntu environment
+        run: |
+          echo "=== OPERATING SYSTEM ==="
+          uname -a
+          lsb_release -a
+
+          echo "=== USER PRIVILEGES ==="
+          whoami
+          sudo -n true
+          echo "Passwordless sudo available"
+
+      - name: Check networking capabilities
+        run: |
+          echo "=== NETWORK NAMESPACES ==="
+          sudo ip netns list
+
+          echo "=== KERNEL CAPABILITIES ==="
+          grep -E 'CapEff|CapBnd' /proc/self/status
+
+          echo "=== NETWORK ADMINISTRATION TEST ==="
+          sudo ip netns add p5test
+          sudo ip netns list
+          sudo ip netns delete p5test
+
+      - name: Install Mininet and Open vSwitch
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            mininet \
+            openvswitch-switch \
+            openvswitch-common \
+            iputils-ping
+
+          echo "=== MININET ==="
+          mn --version
+
+          echo "=== OPEN VSWITCH ==="
+          ovs-vsctl --version
+
+      - name: Start Open vSwitch
+        run: |
+          sudo systemctl start openvswitch-switch
+          sudo ovs-vsctl show
+
+      - name: Test Mininet host connectivity
+        run: |
+          sudo mn -c
+          sudo timeout 90s mn \
+            --switch ovsbr \
+            --controller none \
+            --test pingall
+
+      - name: Clean up lab network
+        if: always()
+        run: |
+          sudo mn -c || true
