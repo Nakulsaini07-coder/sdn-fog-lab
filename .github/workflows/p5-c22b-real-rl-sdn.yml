@@ -724,28 +724,28 @@ jobs:
                       ) in log_text
 
                   
-                evidence["network_results"] = network_results
-                evidence["status"] = "PASS"
-                evidence["enforcement_scope"] = (
-                    "High-risk zero-trust BLOCK; "
-                    "other predicted actions audited only"
-                )
                 
-                # Write completed evidence to a separate output file.
-                # This avoids modifying the original inference artifact.
-                final_evidence_path = Path(
-                    "/tmp/p5-c22b-final-evidence.json"
-                )
-                
-                final_evidence_path.write_text(
-                    json.dumps(evidence, indent=2),
-                    encoding="utf-8"
-                )
-                
-                print(
-                    "[PASS] Final integration evidence saved",
-                    flush=True
-                )
+                  evidence["network_results"] = network_results
+                  evidence["status"] = "PASS"
+                  evidence["enforcement_scope"] = (
+                      "High-risk zero-trust BLOCK; "
+                      "other predicted actions audited only"
+                  )
+
+                  final_evidence_path = Path(
+                      "/tmp/p5-c22b-final-evidence.json"
+                  )
+
+                  final_evidence_path.write_text(
+                      json.dumps(evidence, indent=2),
+                      encoding="utf-8"
+                  )
+
+                  print(
+                      "[PASS] Final integration evidence saved",
+                      flush=True
+                  )
+
 
 
                   print(
