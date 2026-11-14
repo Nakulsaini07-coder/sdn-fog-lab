@@ -13,7 +13,7 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      - name: Install SDN components
+      - name: Install SDN components and OS-Ken
         run: |
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
@@ -25,150 +25,323 @@ jobs:
 
           python3 -m venv /tmp/p5-osken
           /tmp/p5-osken/bin/pip install os-ken==3.1.1
-          echo "=== OS-KEN EXECUTABLE CHECK ==="
+          /tmp/p5-osken/bin/osken-manager --help >/tmp/p5-osken-help.txt
 
-          ls -l /tmp/p5-osken/bin/osken-manager
-          
-          /tmp/p5-osken/bin/osken-manager --help > /tmp/osken-help.txt
-          
-          echo "OS-KEN MANAGER: AVAILABLE"
+          echo "[PASS] OS-Ken 3.1.1 installed"
 
-          
-          /tmp/p5-osken/bin/python - <<'PY'
-          import os_ken
-          import importlib.util
-          import pkgutil
-
-          print("=== OS-KEN PACKAGE ===")
-          print("Package location:", os_ken.__file__)
-
-          print("\n=== AVAILABLE APP MODULES ===")
-          import os_ken.app
-          for module in pkgutil.iter_modules(os_ken.app.__path__):
-              print(module.name)
-
-          print("\n=== CORE MODULE AVAILABILITY ===")
-          required = [
-              "os_ken.base.app_manager",
-              "os_ken.controller.ofp_event",
-              "os_ken.controller.handler",
-              "os_ken.ofproto.ofproto_v1_3"
-          ]
-
-          for name in required:
-              spec = importlib.util.find_spec(name)
-              print(name, ":", "FOUND" if spec else "MISSING")
-              assert spec is not None, name
-
-          print("\nP5_C21 CORE MODULE DISCOVERY: PASS")
-          PY
-
-
-        
-      - name: Test custom OS-Ken controller
+      - name: P5_C21C custom controller ALLOW BLOCK RESTORE
         run: |
-          cat > /tmp/p5_custom_controller.py <<'PY'
+          cat > /tmp/p5_custom_controller.py <<'PY_CONTROLLER'
+          import json
+          import os
           from os_ken.base import app_manager
           from os_ken.controller import ofp_event
-          from os_ken.controller.handler import (
-              CONFIG_DISPATCHER, MAIN_DISPATCHER, set_ev_cls
-          )
+          from os_ken.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, set_ev_cls
+          from os_ken.lib import hub
           from os_ken.ofproto import ofproto_v1_3
+
+          COMMAND_FILE = "/tmp/p5-policy-command.json"
+          ACK_FILE = "/tmp/p5-policy-ack.json"
+          COOKIE = 0x21C
 
           class P5CustomController(app_manager.OSKenApp):
               OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
-              @set_ev_cls(
-                  ofp_event.EventOFPSwitchFeatures,
-                  CONFIG_DISPATCHER
-              )
+              def __init__(self, *args, **kwargs):
+                  super().__init__(*args, **kwargs)
+                  self.datapaths = {}
+                  self.last_request_id = None
+                  self.policy_worker = hub.spawn(self.policy_loop)
+
+              @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
               def switch_features(self, ev):
                   dp = ev.msg.datapath
                   ofp = dp.ofproto
                   parser = dp.ofproto_parser
+                  self.datapaths[dp.id] = dp
 
-                  match = parser.OFPMatch()
                   actions = [
                       parser.OFPActionOutput(
                           ofp.OFPP_CONTROLLER,
                           ofp.OFPCML_NO_BUFFER
                       )
                   ]
+
                   instructions = [
                       parser.OFPInstructionActions(
-                          ofp.OFPIT_APPLY_ACTIONS, actions
+                          ofp.OFPIT_APPLY_ACTIONS,
+                          actions
                       )
                   ]
 
-                  flow = parser.OFPFlowMod(
+                  dp.send_msg(parser.OFPFlowMod(
                       datapath=dp,
                       priority=0,
-                      match=match,
+                      match=parser.OFPMatch(),
                       instructions=instructions
-                  )
-                  dp.send_msg(flow)
+                  ))
 
                   self.logger.info(
                       "P5_CUSTOM_CONTROLLER: SWITCH_CONNECTED dpid=%s",
                       dp.id
                   )
 
-              @set_ev_cls(
-                  ofp_event.EventOFPPacketIn,
-                  MAIN_DISPATCHER
-              )
+              @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
               def packet_in(self, ev):
                   msg = ev.msg
                   dp = msg.datapath
+                  parser = dp.ofproto_parser
+                  ofp = dp.ofproto
+
+                  dp.send_msg(parser.OFPPacketOut(
+                      datapath=dp,
+                      buffer_id=ofp.OFP_NO_BUFFER,
+                      in_port=msg.match["in_port"],
+                      actions=[
+                          parser.OFPActionOutput(ofp.OFPP_FLOOD)
+                      ],
+                      data=msg.data
+                  ))
+
+              def policy_loop(self):
+                  while True:
+                      try:
+                          if os.path.isfile(COMMAND_FILE):
+                              with open(
+                                  COMMAND_FILE,
+                                  encoding="utf-8"
+                              ) as fh:
+                                  request = json.load(fh)
+
+                              request_id = request.get("request_id")
+
+                              if request_id != self.last_request_id:
+                                  self.last_request_id = request_id
+                                  action = request.get("action")
+
+                                  self.apply_policy(action)
+
+                                  reply = {
+                                      "request_id": request_id,
+                                      "action": action,
+                                      "status": "SENT"
+                                  }
+
+                                  temporary = ACK_FILE + ".tmp"
+
+                                  with open(
+                                      temporary,
+                                      "w",
+                                      encoding="utf-8"
+                                  ) as fh:
+                                      json.dump(reply, fh)
+
+                                  os.replace(temporary, ACK_FILE)
+
+                                  self.logger.info(
+                                      "P5_POLICY: %s request_id=%s",
+                                      action,
+                                      request_id
+                                  )
+
+                      except Exception:
+                          self.logger.exception(
+                              "P5_POLICY: command processing error"
+                          )
+
+                      hub.sleep(0.1)
+
+              def apply_policy(self, action):
+                  if action not in ("BLOCK", "RESTORE"):
+                      raise ValueError(
+                          "Unsupported policy action: %r" % action
+                      )
+
+                  if 1 not in self.datapaths:
+                      raise RuntimeError(
+                          "Switch DPID 1 is not connected"
+                      )
+
+                  dp = self.datapaths[1]
                   ofp = dp.ofproto
                   parser = dp.ofproto_parser
 
-                  in_port = msg.match["in_port"]
-                  actions = [
-                      parser.OFPActionOutput(ofp.OFPP_FLOOD)
-                  ]
-
-                  packet_out = parser.OFPPacketOut(
-                      datapath=dp,
-                      buffer_id=ofp.OFP_NO_BUFFER,
-                      in_port=in_port,
-                      actions=actions,
-                      data=msg.data
+                  match = parser.OFPMatch(
+                      eth_type=0x0800,
+                      ipv4_src="10.0.0.1",
+                      ipv4_dst="10.0.0.2"
                   )
-                  dp.send_msg(packet_out)
-          PY
 
-          sudo python3 - <<'PY'
+                  if action == "BLOCK":
+                      # No output instructions means DROP.
+                      mod = parser.OFPFlowMod(
+                          datapath=dp,
+                          cookie=COOKIE,
+                          priority=200,
+                          match=match,
+                          instructions=[]
+                      )
+
+                  else:
+                      # Remove only our matching BLOCK policy.
+                      mod = parser.OFPFlowMod(
+                          datapath=dp,
+                          command=ofp.OFPFC_DELETE_STRICT,
+                          cookie=COOKIE,
+                          cookie_mask=0xffffffffffffffff,
+                          table_id=0,
+                          priority=200,
+                          match=match,
+                          out_port=ofp.OFPP_ANY,
+                          out_group=ofp.OFPG_ANY
+                      )
+
+                  dp.send_msg(mod)
+          PY_CONTROLLER
+
+          sudo python3 - <<'PY_TEST'
+          import json
+          import os
+          import re
           import subprocess
           import time
-          import re
 
+          from pathlib import Path
           from mininet.net import Mininet
           from mininet.node import OVSSwitch, RemoteController
           from mininet.log import setLogLevel
 
           setLogLevel("warning")
-          process = None
+
+          CONTROLLER_LOG = Path("/tmp/p5-controller.log")
+          CMD = Path("/tmp/p5-policy-command.json")
+          ACK = Path("/tmp/p5-policy-ack.json")
+
+          controller = None
           net = None
 
+          def flows():
+              return subprocess.check_output(
+                  [
+                      "ovs-ofctl",
+                      "-O",
+                      "OpenFlow13",
+                      "dump-flows",
+                      "s1"
+                  ],
+                  text=True
+              )
+
+          def block_present():
+              for line in flows().splitlines():
+                  if (
+                      "priority=200" in line
+                      and "nw_src=10.0.0.1" in line
+                      and "nw_dst=10.0.0.2" in line
+                      and "actions=drop" in line
+                  ):
+                      return True
+
+              return False
+
+          def wait_until(label, predicate, timeout=25):
+              deadline = time.monotonic() + timeout
+
+              while time.monotonic() < deadline:
+                  if controller.poll() is not None:
+                      raise RuntimeError(
+                          "OS-Ken exited before " + label
+                      )
+
+                  if predicate():
+                      print(
+                          "[PASS] " + label,
+                          flush=True
+                      )
+                      return
+
+                  time.sleep(0.25)
+
+              raise AssertionError(
+                  "Timed out: " + label
+              )
+
+          def send_policy(action, request_id):
+              ACK.unlink(missing_ok=True)
+
+              payload = {
+                  "action": action,
+                  "request_id": request_id
+              }
+
+              temp = CMD.with_suffix(".tmp")
+
+              temp.write_text(
+                  json.dumps(payload),
+                  encoding="utf-8"
+              )
+
+              os.replace(temp, CMD)
+
+              def acknowledged():
+                  if not ACK.exists():
+                      return False
+
+                  data = json.loads(
+                      ACK.read_text(encoding="utf-8")
+                  )
+
+                  return (
+                      data.get("request_id") == request_id
+                      and data.get("action") == action
+                      and data.get("status") == "SENT"
+                  )
+
+              wait_until(
+                  "Controller accepted " + action + " policy",
+                  acknowledged
+              )
+
+          def ping_loss(h1, ip):
+              result = h1.cmd(
+                  "ping -n -c 3 -W 2 " + ip
+              )
+
+              print(result, flush=True)
+
+              match = re.search(
+                  r"(\d+(?:\.\d+)?)%\s+packet loss",
+                  result
+              )
+
+              if not match:
+                  raise AssertionError(
+                      "Cannot parse ping output"
+                  )
+
+              return float(match.group(1))
+
           try:
-              with open("/tmp/p5-controller.log", "w") as log:
-                  process = subprocess.Popen(
+              for path in (CMD, ACK):
+                  path.unlink(missing_ok=True)
+
+              with CONTROLLER_LOG.open("w") as log:
+                  controller = subprocess.Popen(
                       [
                           "/tmp/p5-osken/bin/osken-manager",
-                          "--ofp-listen-host", "127.0.0.1",
-                          "--ofp-tcp-listen-port", "6653",
+                          "--ofp-listen-host",
+                          "127.0.0.1",
+                          "--ofp-tcp-listen-port",
+                          "6653",
                           "/tmp/p5_custom_controller.py"
                       ],
                       stdout=log,
-                      stderr=subprocess.STDOUT
+                      stderr=subprocess.STDOUT,
+                      env={
+                          **os.environ,
+                          "PYTHONUNBUFFERED": "1"
+                      }
                   )
-
-                  time.sleep(3)
-                  if process.poll() is not None:
-                      raise RuntimeError(
-                          "Custom OS-Ken controller exited early"
-                      )
 
                   net = Mininet(
                       controller=None,
@@ -184,8 +357,15 @@ jobs:
                       port=6653
                   )
 
-                  h1 = net.addHost("h1", ip="10.0.0.1/24")
-                  h2 = net.addHost("h2", ip="10.0.0.2/24")
+                  h1 = net.addHost(
+                      "h1",
+                      ip="10.0.0.1/24"
+                  )
+
+                  h2 = net.addHost(
+                      "h2",
+                      ip="10.0.0.2/24"
+                  )
 
                   s1 = net.addSwitch(
                       "s1",
@@ -196,94 +376,204 @@ jobs:
 
                   net.addLink(h1, s1)
                   net.addLink(h2, s1)
+
                   net.build()
                   net.start()
 
-                  # Wait for the real connection instead of a one-shot readiness check.
-                  connected = False
-                  for attempt in range(1, 41):
-                      if process.poll() is not None:
-                          raise RuntimeError("OS-Ken controller exited")
-                      status = subprocess.check_output(
-                          ["ovs-vsctl", "--columns=is_connected", "list", "Controller"],
-                          text=True
+                  wait_until(
+                      "OVS controller connected",
+                      lambda: bool(re.search(
+                          r"is_connected\s*:\s*true",
+                          subprocess.check_output(
+                              [
+                                  "ovs-vsctl",
+                                  "--columns=is_connected",
+                                  "list",
+                                  "Controller"
+                              ],
+                              text=True
+                          )
+                      )),
+                      timeout=30
+                  )
+
+                  wait_until(
+                      "OS-Ken switch handshake",
+                      lambda:
+                      "P5_CUSTOM_CONTROLLER: SWITCH_CONNECTED dpid=1"
+                      in CONTROLLER_LOG.read_text(
+                          encoding="utf-8"
                       )
-                      print(f"[CONNECTION CHECK {attempt}/40] {status.strip()}", flush=True)
-                      if re.search(r"is_connected\s*:\s*true", status):
-                          connected = True
-                          break
-                      time.sleep(0.5)
-                  assert connected, "OVS controller was not connected after 20 seconds"
-                  print("[PASS] Custom controller connected", flush=True)
+                  )
 
-                  # Verify our switch-features handler was really called.
-                  handshake_seen = False
-                  for attempt in range(1, 21):
-                      with open("/tmp/p5-controller.log") as fh:
-                          log_text = fh.read()
-                      if "P5_CUSTOM_CONTROLLER: SWITCH_CONNECTED dpid=1" in log_text:
-                          handshake_seen = True
-                          break
-                      time.sleep(0.25)
-                  assert handshake_seen, "Custom switch-features handler not observed"
-                  print("[PASS] Custom switch-features handler fired", flush=True)
+                  wait_until(
+                      "Table-miss flow installed",
+                      lambda:
+                      "actions=CONTROLLER" in flows()
+                  )
 
-                  # Flow installation is asynchronous, so retry the dataplane check too.
-                  flow_found = False
-                  for attempt in range(1, 21):
-                      flows = subprocess.check_output(
-                          ["ovs-ofctl", "-O", "OpenFlow13", "dump-flows", "s1"],
-                          text=True
-                      )
-                      if "actions=CONTROLLER" in flows:
-                          flow_found = True
-                          break
-                      time.sleep(0.25)
-                  print(flows, flush=True)
-                  assert flow_found, "Table-miss controller rule missing"
-                  print("[PASS] Table-miss rule installed", flush=True)
+                  print(
+                      "\n=== BASELINE ALLOW ===",
+                      flush=True
+                  )
 
-                  print("\n=== CUSTOM CONTROLLER PING TEST ===", flush=True)
-                  loss = net.pingAll(timeout="2")
-                  print(f"Packet loss: {loss}%", flush=True)
-                  assert loss == 0.0, f"Forwarding failed: {loss}% packet loss"
+                  baseline = ping_loss(
+                      h1,
+                      "10.0.0.2"
+                  )
 
-                  print("\nP5_C21B RESULTS", flush=True)
-                  print("Custom controller : PASS", flush=True)
-                  print("OpenFlow 1.3      : PASS", flush=True)
-                  print("Packet forwarding : PASS", flush=True)
+                  assert baseline == 0.0, (
+                      "Baseline forwarding failed"
+                  )
 
-          except Exception:
-              print("\n=== CONTROLLER DIAGNOSTICS ===", flush=True)
-              subprocess.run(["ovs-vsctl", "show"], check=False)
-              subprocess.run(
-                  ["ovs-vsctl", "--columns=target,is_connected,status", "list", "Controller"],
-                  check=False
-              )
-              if __import__("os").path.isfile("/tmp/p5-controller.log"):
-                  print(open("/tmp/p5-controller.log").read(), flush=True)
-              raise
+                  print(
+                      "[PASS] Baseline ALLOW (0% loss)",
+                      flush=True
+                  )
+
+                  print(
+                      "\n=== CONTROLLER BLOCK ===",
+                      flush=True
+                  )
+
+                  send_policy(
+                      "BLOCK",
+                      "c21c-block-001"
+                  )
+
+                  wait_until(
+                      "Controller-installed BLOCK flow present",
+                      block_present
+                  )
+
+                  print(flows(), flush=True)
+
+                  blocked = ping_loss(
+                      h1,
+                      "10.0.0.2"
+                  )
+
+                  assert blocked == 100.0, (
+                      "BLOCK ineffective: %s%% loss" % blocked
+                  )
+
+                  print(
+                      "[PASS] BLOCK (100% packet loss)",
+                      flush=True
+                  )
+
+                  print(
+                      "\n=== CONTROLLER RESTORE ===",
+                      flush=True
+                  )
+
+                  send_policy(
+                      "RESTORE",
+                      "c21c-restore-002"
+                  )
+
+                  wait_until(
+                      "Controller removed BLOCK flow",
+                      lambda: not block_present()
+                  )
+
+                  print(flows(), flush=True)
+
+                  restored = ping_loss(
+                      h1,
+                      "10.0.0.2"
+                  )
+
+                  assert restored == 0.0, (
+                      "RESTORE failed: %s%% loss" % restored
+                  )
+
+                  print(
+                      "[PASS] RESTORE (0% loss)",
+                      flush=True
+                  )
+
+                  log_text = CONTROLLER_LOG.read_text(
+                      encoding="utf-8"
+                  )
+
+                  assert (
+                      "P5_POLICY: BLOCK request_id=c21c-block-001"
+                      in log_text
+                  )
+
+                  assert (
+                      "P5_POLICY: RESTORE request_id=c21c-restore-002"
+                      in log_text
+                  )
+
+                  print(
+                      "[PASS] Both policies originated "
+                      "in custom OS-Ken controller",
+                      flush=True
+                  )
+
+                  print(
+                      "\n" + "=" * 64,
+                      flush=True
+                  )
+
+                  print("P5_C21C RESULTS", flush=True)
+                  print(
+                      "Custom OS-Ken controller : PASS",
+                      flush=True
+                  )
+                  print(
+                      "OpenFlow 1.3 connection  : PASS",
+                      flush=True
+                  )
+                  print(
+                      "Baseline ALLOW           : 0% loss",
+                      flush=True
+                  )
+                  print(
+                      "Controller BLOCK         : 100% loss",
+                      flush=True
+                  )
+                  print(
+                      "Controller RESTORE       : 0% loss",
+                      flush=True
+                  )
+                  print(
+                      "P5_C21C CONTROLLER POLICY ENFORCEMENT: PASS",
+                      flush=True
+                  )
+                  print("=" * 64, flush=True)
+
           finally:
               if net is not None:
                   net.stop()
 
-              if process is not None:
-                  process.terminate()
+              if controller is not None:
+                  controller.terminate()
+
                   try:
-                      process.wait(timeout=5)
+                      controller.wait(timeout=5)
                   except subprocess.TimeoutExpired:
-                      process.kill()
-                      process.wait()
-          PY
+                      controller.kill()
+                      controller.wait()
+          PY_TEST
 
-
-
-      - name: Show controller logs if needed
+      - name: Show controller diagnostics on failure
         if: failure()
         run: |
+          echo "=== OS-Ken controller log ==="
+
           if [ -f /tmp/p5-controller.log ]; then
-            tail -100 /tmp/p5-controller.log
+            tail -150 /tmp/p5-controller.log
           fi
+
+          echo "=== OVS status ==="
+          sudo ovs-vsctl show || true
+          sudo ovs-vsctl list Controller || true
+
+          echo "=== OVS flows ==="
+          sudo ovs-ofctl -O OpenFlow13 dump-flows s1 || true
 
       - name: Clean up Mininet
         if: always()
