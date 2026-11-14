@@ -588,7 +588,8 @@ jobs:
 
           setLogLevel("warning")
 
-          ROOT = Path(os.environ["GITHUB_WORKSPACE"])
+          
+          ROOT = Path.cwd()
           RESULT = ROOT / "results/p5-c24b-inference.json"
 
           evidence = json.loads(RESULT.read_text())
