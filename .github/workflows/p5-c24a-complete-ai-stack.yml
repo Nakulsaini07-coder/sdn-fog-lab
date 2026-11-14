@@ -1,0 +1,459 @@
+
+name: P5 C24A - Complete AI Inference Stack
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  complete-ai-stack:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install inference dependencies
+        run: |
+          python -m pip install --upgrade pip
+
+          python -m pip install \
+            "stable-baselines3==2.9.2" \
+            "scikit-learn" \
+            "joblib"
+
+          python - <<'PY'
+          import torch
+          import sklearn
+          import stable_baselines3
+          import gymnasium
+          import joblib
+
+          print("PyTorch:", torch.__version__)
+          print("Scikit-learn:", sklearn.__version__)
+          print("SB3:", stable_baselines3.__version__)
+          print("Gymnasium:", gymnasium.__version__)
+          print("[PASS] Dependencies available")
+          PY
+
+      - name: Verify saved project artifacts
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import hashlib
+
+          required = [
+              "models/ids/mlp_iid_adversarially_trained_v1.pt",
+              "models/ids/preprocessor_iid_v1.joblib",
+              "models/rl/dqn_digital_twin_best_v1.zip",
+              "models/rl/ppo_digital_twin_best_v1.zip",
+              "source/ids_preprocessing_adapter_v1.py",
+              "source/observation_contract_v1.py",
+          ]
+
+          for name in required:
+              path = Path(name)
+              assert path.is_file(), f"Missing artifact: {name}"
+              print("[FOUND]", name, path.stat().st_size, "bytes")
+
+          ids_path = Path(
+              "models/ids/mlp_iid_adversarially_trained_v1.pt"
+          )
+
+          expected = (
+              "d2c802de79157875e371ef4874e0d103f1"
+              "e9dcf04db387f203d233bcd015a090"
+          )
+
+          actual = hashlib.sha256(
+              ids_path.read_bytes()
+          ).hexdigest()
+
+          assert actual == expected, (
+              "Hardened IDS checksum mismatch"
+          )
+
+          print("[PASS] Hardened IDS integrity verified")
+          print("[PASS] All integration files available")
+          PY
+
+      - name: Execute complete AI inference stack
+        run: |
+          cat > /tmp/p5_c24a_verify.py <<'PY'
+          from pathlib import Path
+          import sys
+          import json
+          import hashlib
+
+          import numpy as np
+          import joblib
+          import torch
+          import torch.nn as nn
+
+          from stable_baselines3 import DQN, PPO
+
+          ROOT = Path.cwd()
+          sys.path.insert(0, str(ROOT / "source"))
+
+          from ids_preprocessing_adapter_v1 import (
+              transform_raw_features
+          )
+
+          from observation_contract_v1 import (
+              build_observation, FIELDS
+          )
+
+          IDS_PATH = (
+              ROOT / "models/ids/"
+              "mlp_iid_adversarially_trained_v1.pt"
+          )
+
+          PREP_PATH = (
+              ROOT / "models/ids/"
+              "preprocessor_iid_v1.joblib"
+          )
+
+          DQN_PATH = (
+              ROOT / "models/rl/"
+              "dqn_digital_twin_best_v1.zip"
+          )
+
+          PPO_PATH = (
+              ROOT / "models/rl/"
+              "ppo_digital_twin_best_v1.zip"
+          )
+
+          ACTIONS = {
+              0: "ALLOW",
+              1: "INSPECT",
+              2: "RATE_LIMIT",
+              3: "REDIRECT",
+              4: "BLOCK",
+          }
+
+          print("=" * 72)
+          print("P5_C24A | COMPLETE AI INFERENCE STACK")
+          print("=" * 72)
+
+          # --------------------------------------------
+          # 1. Restore the hardened IDS architecture
+          # --------------------------------------------
+
+          class HardenedMLP(nn.Module):
+              def __init__(self):
+                  super().__init__()
+
+                  self.network = nn.Sequential(
+                      nn.Linear(70, 256),
+                      nn.ReLU(),
+                      nn.Dropout(0.2),
+                      nn.Linear(256, 128),
+                      nn.ReLU(),
+                      nn.Dropout(0.2),
+                      nn.Linear(128, 64),
+                      nn.ReLU(),
+                      nn.Linear(64, 1),
+                  )
+
+              def forward(self, x):
+                  return self.network(x)
+
+          checkpoint = torch.load(
+              IDS_PATH,
+              map_location="cpu",
+              weights_only=True
+          )
+
+          assert checkpoint["input_dim"] == 70
+
+          threshold = float(checkpoint["threshold"])
+          assert threshold == 0.52
+
+          ids = HardenedMLP()
+
+          ids.load_state_dict(
+              checkpoint["model_state_dict"],
+              strict=True
+          )
+
+          ids.eval()
+
+          print("[PASS] Hardened MLP loaded on CPU")
+
+          # --------------------------------------------
+          # 2. Load frozen preprocessing artifact
+          # --------------------------------------------
+
+          preprocessor = joblib.load(PREP_PATH)
+
+          assert len(
+              preprocessor["raw_feature_columns"]
+          ) == 78
+
+          assert len(
+              preprocessor["selected_feature_columns"]
+          ) == 70
+
+          assert (
+              preprocessor["scaler"].n_features_in_
+              == 78
+          )
+
+          print("[PASS] Frozen preprocessor loaded")
+
+          # --------------------------------------------
+          # 3. Restore trained RL controllers
+          # --------------------------------------------
+
+          models = {
+              "DQN": DQN.load(
+                  str(DQN_PATH),
+                  device="cpu"
+              ),
+              "PPO": PPO.load(
+                  str(PPO_PATH),
+                  device="cpu"
+              ),
+          }
+
+          for name, model in models.items():
+              assert model.observation_space.shape == (8,)
+              assert model.action_space.n == 5
+
+              print("[PASS]", name, "loaded on CPU")
+
+          # --------------------------------------------
+          # 4. Frozen zero-trust rules
+          # --------------------------------------------
+
+          def zero_trust(action, risk, trust):
+              assert action in ACTIONS
+              assert 0 <= risk <= 1
+              assert 0 <= trust <= 1
+
+              if trust < 0.20 and risk > 0.70:
+                  return 4, "MANDATORY_BLOCK"
+
+              if (
+                  trust < 0.35
+                  and risk > 0.55
+                  and action == 0
+              ):
+                  return 1, "ESCALATE_TO_INSPECT"
+
+              return action, "NO_OVERRIDE"
+
+          # --------------------------------------------
+          # 5. Controlled diagnostic inputs
+          # --------------------------------------------
+
+          scaler = preprocessor["scaler"]
+
+          min_values = np.asarray(
+              scaler.data_min_, dtype=np.float64
+          )
+
+          max_values = np.asarray(
+              scaler.data_max_, dtype=np.float64
+          )
+
+          assert min_values.shape == (78,)
+          assert max_values.shape == (78,)
+
+          probes = {
+              "FITTED_MIN": min_values,
+              "FITTED_MIDPOINT": (
+                  min_values
+                  + 0.5 * (max_values - min_values)
+              ),
+              "FITTED_MAX": max_values,
+          }
+
+          raw_names = list(
+              preprocessor["raw_feature_columns"]
+          )
+
+          evidence = {
+              "cell": "P5_C24A",
+              "status": "PASS",
+              "platform": "github_actions_ubuntu",
+              "device": "cpu",
+              "real_hardened_ids": True,
+              "real_dqn_ppo": True,
+              "input_mode": "synthetic_diagnostic",
+              "live_sdn": False,
+              "ground_truth_evaluation": False,
+              "threshold": threshold,
+              "model_hashes": {},
+              "records": [],
+          }
+
+          for name, path in [
+              ("IDS", IDS_PATH),
+              ("DQN", DQN_PATH),
+              ("PPO", PPO_PATH),
+          ]:
+              evidence["model_hashes"][name] = (
+                  hashlib.sha256(
+                      path.read_bytes()
+                  ).hexdigest()
+              )
+
+          # --------------------------------------------
+          # 6. Real IDS -> RL -> Zero Trust inference
+          # --------------------------------------------
+
+          for probe_name, raw_vector in probes.items():
+
+              raw_dict = {
+                  name: float(value)
+                  for name, value in zip(
+                      raw_names, raw_vector
+                  )
+              }
+
+              x = transform_raw_features(
+                  raw_dict, preprocessor
+              )
+
+              assert x.shape == (1, 70)
+              assert np.isfinite(x).all()
+
+              with torch.no_grad():
+                  logits = ids(
+                      torch.from_numpy(x).float()
+                  )
+
+                  risk = float(
+                      torch.sigmoid(logits).item()
+                  )
+
+              assert np.isfinite(risk)
+              assert 0 <= risk <= 1
+
+              values = {
+                  "traffic_intensity": 0.50,
+                  "queue_utilization": 0.40,
+                  "estimated_latency": 0.35,
+                  "bandwidth_utilization": 0.45,
+                  "ids_risk_score": risk,
+                  "device_trust_score": 0.50,
+                  "service_health": 0.90,
+                  "active_security_policy": 0.00,
+              }
+
+              provenance = {
+                  field: "SYNTHETIC"
+                  for field in FIELDS
+              }
+
+              provenance["ids_risk_score"] = (
+                  "IDS_INFERENCE"
+              )
+
+              provenance["active_security_policy"] = (
+                  "POLICY_STATE"
+              )
+
+              observation = build_observation(
+                  values, provenance
+              )
+
+              assert observation.shape == (8,)
+              assert observation.dtype == np.float32
+
+              print("\nPROBE:", probe_name)
+              print("Real IDS risk:", risk)
+
+              for model_name, model in models.items():
+                  predicted, _ = model.predict(
+                      observation,
+                      deterministic=True
+                  )
+
+                  action = int(
+                      np.asarray(predicted).item()
+                  )
+
+                  assert action in ACTIONS
+
+                  final, reason = zero_trust(
+                      action,
+                      risk,
+                      float(observation[5])
+                  )
+
+                  record = {
+                      "probe": probe_name,
+                      "model": model_name,
+                      "ids_risk": risk,
+                      "rl_action": ACTIONS[action],
+                      "final_action": ACTIONS[final],
+                      "zero_trust_reason": reason,
+                      "observation": observation.tolist(),
+                  }
+
+                  evidence["records"].append(record)
+
+                  print(
+                      model_name,
+                      "RL =", ACTIONS[action],
+                      "FINAL =", ACTIONS[final],
+                      "RULE =", reason,
+                      flush=True
+                  )
+
+          assert len(evidence["records"]) == 6
+
+          # --------------------------------------------
+          # 7. Save evidence within the workspace
+          # --------------------------------------------
+
+          output_dir = ROOT / "results"
+          output_dir.mkdir(exist_ok=True)
+
+          output = (
+              output_dir
+              / "p5-c24a-inference-evidence.json"
+          )
+
+          output.write_text(
+              json.dumps(evidence, indent=2),
+              encoding="utf-8"
+          )
+
+          print("\n" + "=" * 72)
+          print("P5_C24A FINAL RESULTS")
+          print("=" * 72)
+          print("Hardened IDS checkpoint : PASS")
+          print("78 -> 70 preprocessor  : PASS")
+          print("IDS risk inference     : PASS")
+          print("Observation contract   : PASS")
+          print("Real DQN inference     : PASS")
+          print("Real PPO inference     : PASS")
+          print("Zero-trust decisions   : PASS")
+          print("Total decisions        :", len(evidence["records"]))
+          print("Evidence file          :", output)
+          print("P5_C24A               : PASS")
+          print("=" * 72)
+
+          PY
+
+          python /tmp/p5_c24a_verify.py
+
+      - name: Upload Cell 24A evidence
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: p5-c24a-complete-ai-stack
+          path: results/p5-c24a-inference-evidence.json
+          retention-days: 30
+          if-no-files-found: error
