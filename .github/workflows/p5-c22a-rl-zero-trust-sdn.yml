@@ -1,0 +1,666 @@
+
+name: P5 C22A - RL Zero Trust SDN Integration
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rl-zero-trust-sdn:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Install SDN environment
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            mininet openvswitch-switch openvswitch-common \
+            iproute2 iputils-ping python3-venv
+
+          sudo systemctl start openvswitch-switch
+          sudo mn -c
+
+          python3 -m venv /tmp/p5-osken
+          /tmp/p5-osken/bin/pip install os-ken==3.1.1
+
+          /tmp/p5-osken/bin/osken-manager --help \
+            >/tmp/p5-osken-help.txt
+
+          echo "[PASS] SDN environment ready"
+
+      - name: Create custom OS-Ken controller
+        run: |
+          cat > /tmp/p5_c22a_controller.py <<'PY'
+          import json
+          import os
+
+          from os_ken.base import app_manager
+          from os_ken.controller import ofp_event
+          from os_ken.controller.handler import (
+              CONFIG_DISPATCHER,
+              MAIN_DISPATCHER,
+              DEAD_DISPATCHER,
+              set_ev_cls,
+          )
+          from os_ken.lib import hub
+          from os_ken.ofproto import ofproto_v1_3
+
+          CMD = "/tmp/p5-c22a-command.json"
+          ACK = "/tmp/p5-c22a-ack.json"
+          COOKIE = 0x22A
+
+
+          class P5C22AController(app_manager.OSKenApp):
+              OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
+
+              def __init__(self, *args, **kwargs):
+                  super().__init__(*args, **kwargs)
+                  self.datapaths = {}
+                  self.last_request = None
+                  self.worker = hub.spawn(self.policy_loop)
+
+              @set_ev_cls(
+                  ofp_event.EventOFPSwitchFeatures,
+                  CONFIG_DISPATCHER
+              )
+              def switch_features(self, ev):
+                  dp = ev.msg.datapath
+                  self.datapaths[dp.id] = dp
+
+                  ofp = dp.ofproto
+                  parser = dp.ofproto_parser
+
+                  actions = [
+                      parser.OFPActionOutput(
+                          ofp.OFPP_CONTROLLER,
+                          ofp.OFPCML_NO_BUFFER
+                      )
+                  ]
+
+                  instructions = [
+                      parser.OFPInstructionActions(
+                          ofp.OFPIT_APPLY_ACTIONS,
+                          actions
+                      )
+                  ]
+
+                  dp.send_msg(parser.OFPFlowMod(
+                      datapath=dp,
+                      priority=0,
+                      match=parser.OFPMatch(),
+                      instructions=instructions
+                  ))
+
+                  self.logger.info(
+                      "P5_C22A: SWITCH_CONNECTED dpid=%s",
+                      dp.id
+                  )
+
+              @set_ev_cls(
+                  ofp_event.EventOFPStateChange,
+                  DEAD_DISPATCHER
+              )
+              def disconnected(self, ev):
+                  self.datapaths.pop(ev.datapath.id, None)
+
+              @set_ev_cls(
+                  ofp_event.EventOFPPacketIn,
+                  MAIN_DISPATCHER
+              )
+              def packet_in(self, ev):
+                  msg = ev.msg
+                  dp = msg.datapath
+                  ofp = dp.ofproto
+                  parser = dp.ofproto_parser
+
+                  dp.send_msg(parser.OFPPacketOut(
+                      datapath=dp,
+                      buffer_id=ofp.OFP_NO_BUFFER,
+                      in_port=msg.match["in_port"],
+                      actions=[
+                          parser.OFPActionOutput(
+                              ofp.OFPP_FLOOD
+                          )
+                      ],
+                      data=msg.data
+                  ))
+
+              def policy_loop(self):
+                  while True:
+                      try:
+                          if os.path.isfile(CMD):
+                              with open(CMD) as f:
+                                  request = json.load(f)
+
+                              rid = request["request_id"]
+
+                              if rid != self.last_request:
+                                  action = request["action"]
+
+                                  self.apply_policy(action)
+                                  self.last_request = rid
+
+                                  response = {
+                                      "request_id": rid,
+                                      "action": action,
+                                      "status": "SENT"
+                                  }
+
+                                  tmp = ACK + ".tmp"
+                                  with open(tmp, "w") as f:
+                                      json.dump(response, f)
+                                  os.replace(tmp, ACK)
+
+                                  self.logger.info(
+                                      "P5_C22A POLICY action=%s id=%s",
+                                      action,
+                                      rid
+                                  )
+
+                      except Exception:
+                          self.logger.exception(
+                              "P5_C22A policy error"
+                          )
+
+                      hub.sleep(0.1)
+
+              def apply_policy(self, action):
+                  if action not in ("ALLOW", "BLOCK"):
+                      raise ValueError(
+                          "Unsupported action: " + str(action)
+                      )
+
+                  if 1 not in self.datapaths:
+                      raise RuntimeError(
+                          "DPID 1 is not connected"
+                      )
+
+                  dp = self.datapaths[1]
+                  ofp = dp.ofproto
+                  parser = dp.ofproto_parser
+
+                  match = parser.OFPMatch(
+                      eth_type=0x0800,
+                      ipv4_src="10.0.0.1",
+                      ipv4_dst="10.0.0.2"
+                  )
+
+                  if action == "BLOCK":
+                      mod = parser.OFPFlowMod(
+                          datapath=dp,
+                          cookie=COOKIE,
+                          table_id=0,
+                          priority=200,
+                          match=match,
+                          instructions=[]
+                      )
+                  else:
+                      mod = parser.OFPFlowMod(
+                          datapath=dp,
+                          command=ofp.OFPFC_DELETE_STRICT,
+                          cookie=COOKIE,
+                          cookie_mask=0xffffffffffffffff,
+                          table_id=0,
+                          priority=200,
+                          match=match,
+                          out_port=ofp.OFPP_ANY,
+                          out_group=ofp.OFPG_ANY
+                      )
+
+                  dp.send_msg(mod)
+          PY
+
+          echo "[PASS] Custom controller created"
+
+      - name: Run RL Zero Trust SDN integration test
+        run: |
+          sudo python3 - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import time
+          from pathlib import Path
+
+          from mininet.net import Mininet
+          from mininet.node import OVSSwitch, RemoteController
+          from mininet.log import setLogLevel
+
+          setLogLevel("warning")
+
+          LOG = Path("/tmp/p5-c22a-controller.log")
+          CMD = Path("/tmp/p5-c22a-command.json")
+          ACK = Path("/tmp/p5-c22a-ack.json")
+
+          controller = None
+          net = None
+
+          ACTIONS = {
+              0: "ALLOW",
+              1: "INSPECT",
+              2: "RATE_LIMIT",
+              3: "REDIRECT",
+              4: "BLOCK"
+          }
+
+
+          def zero_trust(rl_action, risk, trust):
+              """
+              Reproduce the existing V1/V2
+              zero-trust override conditions.
+              """
+              if not 0 <= risk <= 1:
+                  raise ValueError("Invalid IDS risk")
+
+              if not 0 <= trust <= 1:
+                  raise ValueError("Invalid device trust")
+
+              if rl_action not in ACTIONS:
+                  raise ValueError("Invalid RL action")
+
+              # Rule 1: mandatory block.
+              if trust < 0.20 and risk > 0.70:
+                  return 4
+
+              # Rule 2: escalate ALLOW to INSPECT.
+              if (
+                  trust < 0.35
+                  and risk > 0.55
+                  and rl_action == 0
+              ):
+                  return 1
+
+              return rl_action
+
+
+          def dump_flows():
+              return subprocess.check_output(
+                  [
+                      "ovs-ofctl",
+                      "-O",
+                      "OpenFlow13",
+                      "dump-flows",
+                      "s1"
+                  ],
+                  text=True
+              )
+
+
+          def has_block():
+              for line in dump_flows().splitlines():
+                  if (
+                      "priority=200" in line
+                      and "nw_src=10.0.0.1" in line
+                      and "nw_dst=10.0.0.2" in line
+                      and "actions=drop" in line
+                  ):
+                      return True
+              return False
+
+
+          def wait_for(label, predicate, timeout=30):
+              deadline = time.monotonic() + timeout
+
+              while time.monotonic() < deadline:
+                  if controller.poll() is not None:
+                      raise RuntimeError(
+                          "Controller exited: " + label
+                      )
+
+                  if predicate():
+                      print("[PASS] " + label, flush=True)
+                      return
+
+                  time.sleep(0.25)
+
+              raise AssertionError(
+                  "Timeout waiting for " + label
+              )
+
+
+          def ovs_connected():
+              result = subprocess.check_output(
+                  [
+                      "ovs-vsctl",
+                      "--columns=is_connected",
+                      "list",
+                      "Controller"
+                  ],
+                  text=True
+              )
+              return bool(
+                  re.search(
+                      r"is_connected\s*:\s*true",
+                      result
+                  )
+              )
+
+
+          def send_command(action, rid):
+              ACK.unlink(missing_ok=True)
+
+              request = {
+                  "action": action,
+                  "request_id": rid
+              }
+
+              tmp = CMD.with_suffix(".tmp")
+              tmp.write_text(json.dumps(request))
+              os.replace(tmp, CMD)
+
+              def acknowledged():
+                  if not ACK.exists():
+                      return False
+
+                  response = json.loads(
+                      ACK.read_text()
+                  )
+
+                  return (
+                      response.get("request_id") == rid
+                      and response.get("action") == action
+                      and response.get("status") == "SENT"
+                  )
+
+              wait_for(
+                  "OS-Ken accepted " + action,
+                  acknowledged
+              )
+
+
+          def ping_loss(host):
+              output = host.cmd(
+                  "ping -n -c 3 -W 2 10.0.0.2"
+              )
+
+              print(output, flush=True)
+
+              match = re.search(
+                  r"(\d+(?:\.\d+)?)%\s+packet loss",
+                  output
+              )
+
+              if match is None:
+                  raise AssertionError(
+                      "Unable to parse ping result"
+                  )
+
+              return float(match.group(1))
+
+
+          def run_scenario(
+              name, rl_action, risk, trust,
+              expected_action, expected_loss, rid
+          ):
+              print("\n" + "=" * 64, flush=True)
+              print(name, flush=True)
+              print("=" * 64, flush=True)
+
+              result = zero_trust(
+                  rl_action, risk, trust
+              )
+
+              action = ACTIONS[result]
+
+              print("RL action      :", ACTIONS[rl_action])
+              print("IDS risk       :", risk)
+              print("Device trust   :", trust)
+              print("Final policy   :", action)
+
+              assert action == expected_action, (
+                  "Zero-trust decision mismatch"
+              )
+
+              if result != rl_action:
+                  print(
+                      "[PASS] Zero-trust override applied",
+                      flush=True
+                  )
+              else:
+                  print(
+                      "[PASS] RL decision preserved",
+                      flush=True
+                  )
+
+              if action not in ("ALLOW", "BLOCK"):
+                  raise NotImplementedError(
+                      "SDN enforcement not implemented for "
+                      + action
+                  )
+
+              send_command(action, rid)
+
+              wait_for(
+                  "OVS flow matches " + action,
+                  has_block if action == "BLOCK"
+                  else lambda: not has_block()
+              )
+
+              print(dump_flows(), flush=True)
+
+              loss = ping_loss(h1)
+
+              assert loss == expected_loss, (
+                  "Expected %s%% loss, got %s%%" %
+                  (expected_loss, loss)
+              )
+
+              print(
+                  "[PASS] Network enforcement: "
+                  + action,
+                  flush=True
+              )
+
+              return {
+                  "scenario": name,
+                  "rl_action": ACTIONS[rl_action],
+                  "risk": risk,
+                  "trust": trust,
+                  "final_action": action,
+                  "packet_loss": loss
+              }
+
+
+          try:
+              for path in (CMD, ACK):
+                  path.unlink(missing_ok=True)
+
+              with LOG.open("w") as logfile:
+                  controller = subprocess.Popen(
+                      [
+                          "/tmp/p5-osken/bin/osken-manager",
+                          "--ofp-listen-host",
+                          "127.0.0.1",
+                          "--ofp-tcp-listen-port",
+                          "6653",
+                          "/tmp/p5_c22a_controller.py"
+                      ],
+                      stdout=logfile,
+                      stderr=subprocess.STDOUT,
+                      env={
+                          **os.environ,
+                          "PYTHONUNBUFFERED": "1"
+                      }
+                  )
+
+                  net = Mininet(
+                      controller=None,
+                      switch=OVSSwitch,
+                      autoSetMacs=True,
+                      build=False
+                  )
+
+                  net.addController(
+                      "c0",
+                      controller=RemoteController,
+                      ip="127.0.0.1",
+                      port=6653
+                  )
+
+                  h1 = net.addHost(
+                      "h1",
+                      ip="10.0.0.1/24"
+                  )
+
+                  h2 = net.addHost(
+                      "h2",
+                      ip="10.0.0.2/24"
+                  )
+
+                  s1 = net.addSwitch(
+                      "s1",
+                      protocols="OpenFlow13",
+                      failMode="secure",
+                      dpid="0000000000000001"
+                  )
+
+                  net.addLink(h1, s1)
+                  net.addLink(h2, s1)
+
+                  net.build()
+                  net.start()
+
+                  wait_for(
+                      "OVS controller connected",
+                      ovs_connected
+                  )
+
+                  wait_for(
+                      "OS-Ken handshake",
+                      lambda:
+                      "P5_C22A: SWITCH_CONNECTED dpid=1"
+                      in LOG.read_text()
+                  )
+
+                  wait_for(
+                      "Table-miss forwarding rule",
+                      lambda:
+                      "actions=CONTROLLER" in dump_flows()
+                  )
+
+                  results = []
+
+                  results.append(run_scenario(
+                      name="SCENARIO 1: TRUSTED LOW RISK",
+                      rl_action=0,
+                      risk=0.10,
+                      trust=0.95,
+                      expected_action="ALLOW",
+                      expected_loss=0.0,
+                      rid="c22a-safe"
+                  ))
+
+                  results.append(run_scenario(
+                      name="SCENARIO 2: ZERO TRUST OVERRIDE",
+                      rl_action=0,
+                      risk=0.90,
+                      trust=0.10,
+                      expected_action="BLOCK",
+                      expected_loss=100.0,
+                      rid="c22a-malicious"
+                  ))
+
+                  results.append(run_scenario(
+                      name="SCENARIO 3: TRUST RESTORED",
+                      rl_action=0,
+                      risk=0.08,
+                      trust=0.92,
+                      expected_action="ALLOW",
+                      expected_loss=0.0,
+                      rid="c22a-restore"
+                  ))
+
+                  # Contract-only verification for Rule 2.
+                  # INSPECT enforcement is a later cell.
+                  inspect_result = zero_trust(
+                      rl_action=0,
+                      risk=0.65,
+                      trust=0.30
+                  )
+
+                  assert inspect_result == 1
+
+                  print(
+                      "[PASS] Rule 2 ALLOW -> INSPECT "
+                      "decision contract",
+                      flush=True
+                  )
+
+                  # Verify controller-originated commands.
+                  controller_log = LOG.read_text()
+
+                  for rid in (
+                      "c22a-safe",
+                      "c22a-malicious",
+                      "c22a-restore"
+                  ):
+                      assert ("id=" + rid) in controller_log
+
+                  evidence = {
+                      "cell": "P5_C22A",
+                      "status": "PASS",
+                      "mode": "controlled_rl_style_inputs",
+                      "live_rl_inference": False,
+                      "scenarios": results,
+                      "inspect_contract": "PASS"
+                  }
+
+                  Path(
+                      "/tmp/p5-c22a-results.json"
+                  ).write_text(
+                      json.dumps(evidence, indent=2)
+                  )
+
+                  print("\n" + "=" * 64)
+                  print("P5_C22A FINAL RESULTS")
+                  print("=" * 64)
+                  print("Decision mapping       : PASS")
+                  print("Zero-trust overrides   : PASS")
+                  print("Controller connection  : PASS")
+                  print("OpenFlow enforcement   : PASS")
+                  print("Scenario 1 ALLOW       : 0% loss")
+                  print("Scenario 2 BLOCK       : 100% loss")
+                  print("Scenario 3 RESTORE     : 0% loss")
+                  print("INSPECT contract       : PASS")
+                  print("P5_C22A INTEGRATION    : PASS")
+                  print("=" * 64, flush=True)
+
+          finally:
+              if net is not None:
+                  net.stop()
+
+              if controller is not None:
+                  controller.terminate()
+                  try:
+                      controller.wait(timeout=5)
+                  except subprocess.TimeoutExpired:
+                      controller.kill()
+                      controller.wait()
+          PY
+
+      - name: Upload integration evidence
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: p5-c22a-integration-evidence
+          path: /tmp/p5-c22a-results.json
+          retention-days: 30
+
+      - name: Show diagnostics on failure
+        if: failure()
+        run: |
+          echo "=== Controller log ==="
+          sudo tail -150 /tmp/p5-c22a-controller.log || true
+
+          echo "=== OVS controller ==="
+          sudo ovs-vsctl list Controller || true
+
+          echo "=== OVS flows ==="
+          sudo ovs-ofctl -O OpenFlow13 dump-flows s1 || true
+
+      - name: Clean up Mininet
+        if: always()
+        run: sudo mn -c || true
