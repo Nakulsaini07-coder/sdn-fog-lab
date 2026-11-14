@@ -1,0 +1,933 @@
+
+name: P5 C24B - Hardened IDS RL SDN Enforcement
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  integrated-security:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install AI and SDN dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install \
+            "stable-baselines3==2.9.2" \
+            "scikit-learn==1.6.1" joblib
+
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            mininet openvswitch-switch openvswitch-common \
+            iproute2 iputils-ping python3-venv
+
+          sudo systemctl start openvswitch-switch
+          sudo mn -c
+
+          /usr/bin/python3 -m venv /tmp/p5-osken
+          /tmp/p5-osken/bin/pip install "os-ken==3.1.1"
+
+      - name: Verify required project artifacts
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          required = [
+              "models/ids/mlp_iid_adversarially_trained_v1.pt",
+              "models/ids/preprocessor_iid_v1.joblib",
+              "models/rl/dqn_digital_twin_best_v1.zip",
+              "models/rl/ppo_digital_twin_best_v1.zip",
+              "source/ids_preprocessing_adapter_v1.py",
+              "source/observation_contract_v1.py",
+              "fixtures/p5_c23c_verified_raw_samples_v1.json",
+          ]
+
+          for name in required:
+              assert Path(name).is_file(), (
+                  "Missing artifact: " + name
+              )
+              print("[FOUND]", name)
+
+          print("[PASS] All project artifacts found")
+          PY
+
+      - name: Execute IDS and RL inference
+        run: |
+          mkdir -p results
+
+          cat > /tmp/p5_c24b_inference.py <<'PY'
+          import hashlib
+          import json
+          import sys
+          from pathlib import Path
+
+          import joblib
+          import numpy as np
+          import torch
+          from torch import nn
+          from stable_baselines3 import DQN, PPO
+
+          ROOT = Path.cwd()
+          sys.path.insert(0, str(ROOT / "source"))
+
+          from ids_preprocessing_adapter_v1 import (
+              transform_raw_features
+          )
+          from observation_contract_v1 import (
+              build_observation, FIELDS
+          )
+
+          ACTIONS = [
+              "ALLOW", "INSPECT", "RATE_LIMIT",
+              "REDIRECT", "BLOCK"
+          ]
+
+          class HardenedIDS(nn.Module):
+              def __init__(self):
+                  super().__init__()
+                  self.network = nn.Sequential(
+                      nn.Linear(70, 256),
+                      nn.ReLU(),
+                      nn.Dropout(0.2),
+                      nn.Linear(256, 128),
+                      nn.ReLU(),
+                      nn.Dropout(0.2),
+                      nn.Linear(128, 64),
+                      nn.ReLU(),
+                      nn.Linear(64, 1),
+                  )
+
+              def forward(self, x):
+                  return self.network(x)
+
+          def zero_trust(action, risk, trust):
+              if trust < 0.20 and risk > 0.70:
+                  return 4, "MANDATORY_BLOCK"
+
+              if (
+                  trust < 0.35 and risk > 0.55
+                  and action == 0
+              ):
+                  return 1, "ESCALATE_TO_INSPECT"
+
+              return action, "NO_OVERRIDE"
+
+          print("=" * 70)
+          print("P5_C24B | REAL IDS -> RL -> ZERO TRUST")
+          print("=" * 70)
+
+          ids_path = (
+              ROOT / "models/ids/"
+              "mlp_iid_adversarially_trained_v1.pt"
+          )
+
+          actual_hash = hashlib.sha256(
+              ids_path.read_bytes()
+          ).hexdigest()
+
+          expected_hash = (
+              "d2c802de79157875e371ef4874e0d103f1"
+              "e9dcf04db387f203d233bcd015a090"
+          )
+
+          assert actual_hash == expected_hash
+
+          checkpoint = torch.load(
+              ids_path,
+              map_location="cpu",
+              weights_only=True
+          )
+
+          assert checkpoint["input_dim"] == 70
+          assert float(checkpoint["threshold"]) == 0.52
+
+          ids = HardenedIDS().eval()
+          ids.load_state_dict(
+              checkpoint["model_state_dict"],
+              strict=True
+          )
+
+          preprocessor = joblib.load(
+              ROOT / "models/ids/preprocessor_iid_v1.joblib"
+          )
+
+          assert len(
+              preprocessor["raw_feature_columns"]
+          ) == 78
+          assert len(
+              preprocessor["selected_feature_columns"]
+          ) == 70
+
+          models = {
+              "DQN": DQN.load(
+                  str(
+                      ROOT / "models/rl/"
+                      "dqn_digital_twin_best_v1.zip"
+                  ),
+                  device="cpu"
+              ),
+              "PPO": PPO.load(
+                  str(
+                      ROOT / "models/rl/"
+                      "ppo_digital_twin_best_v1.zip"
+                  ),
+                  device="cpu"
+              ),
+          }
+
+          for model in models.values():
+              assert model.observation_space.shape == (8,)
+              assert model.action_space.n == 5
+
+          print("[PASS] All real AI models loaded")
+
+          cohort_path = (
+              ROOT / "fixtures/"
+              "p5_c23c_verified_raw_samples_v1.json"
+          )
+
+          cohort = json.loads(
+              cohort_path.read_text(encoding="utf-8")
+          )
+
+          assert cohort["cell"] == "P5_C23C_STEP3"
+          assert cohort["status"] == "PASS"
+          assert cohort["split"] == "IID_TEST"
+          assert cohort["full_label_alignment_passed"] is True
+
+          samples = cohort["records"]
+          assert len(samples) == 69
+
+          records = []
+
+          for sample in samples:
+              assert sample["iid_split"] == "TEST"
+
+              x = transform_raw_features(
+                  sample["raw_features"],
+                  preprocessor
+              )
+
+              assert x.shape == (1, 70)
+
+              with torch.no_grad():
+                  risk = float(
+                      torch.sigmoid(
+                          ids(torch.from_numpy(x).float())
+                      ).item()
+                  )
+
+              assert np.isfinite(risk)
+              assert 0 <= risk <= 1
+
+              records.append({
+                  "global_row_id": int(
+                      sample["global_row_id"]
+                  ),
+                  "attack_type": sample["attack_type"],
+                  "true_binary_label": int(
+                      sample["binary_label"]
+                  ),
+                  "ids_risk": risk,
+              })
+
+          print("[PASS] 69 real IDS risk scores generated")
+
+          # Select by actual IDS risk, not ground-truth label.
+          safe = min(
+              records,
+              key=lambda r: (
+                  r["ids_risk"], r["global_row_id"]
+              )
+          )
+
+          high = max(
+              records,
+              key=lambda r: (
+                  r["ids_risk"], -r["global_row_id"]
+              )
+          )
+
+          print("Minimum IDS risk:", safe["ids_risk"])
+          print("Maximum IDS risk:", high["ids_risk"])
+
+          assert safe["ids_risk"] < 0.55, (
+              "No low-risk record found"
+          )
+
+          assert high["ids_risk"] > 0.70, (
+              "No IDS-generated risk above 0.70. "
+              "Expand the held-out cohort instead of "
+              "inventing a high-risk prediction."
+          )
+
+          scenarios = []
+
+          for scenario, record, trust in [
+              ("SAFE", safe, 0.90),
+              ("HIGH_RISK", high, 0.10),
+          ]:
+
+              values = {
+                  "traffic_intensity": 0.50,
+                  "queue_utilization": 0.40,
+                  "estimated_latency": 0.35,
+                  "bandwidth_utilization": 0.45,
+                  "ids_risk_score": record["ids_risk"],
+                  "device_trust_score": trust,
+                  "service_health": 0.90,
+                  "active_security_policy": 0.00,
+              }
+
+              provenance = {
+                  field: "SYNTHETIC"
+                  for field in FIELDS
+              }
+              provenance["ids_risk_score"] = (
+                  "IDS_INFERENCE"
+              )
+              provenance["active_security_policy"] = (
+                  "POLICY_STATE"
+              )
+
+              observation = build_observation(
+                  values, provenance
+              )
+
+              for model_name, model in models.items():
+                  predicted, _ = model.predict(
+                      observation,
+                      deterministic=True
+                  )
+
+                  action = int(
+                      np.asarray(predicted).item()
+                  )
+
+                  final, reason = zero_trust(
+                      action,
+                      record["ids_risk"],
+                      trust
+                  )
+
+                  result = {
+                      "model": model_name,
+                      "scenario": scenario,
+                      "global_row_id": record["global_row_id"],
+                      "ground_truth_evaluation_only":
+                          record["true_binary_label"],
+                      "attack_type_evaluation_only":
+                          record["attack_type"],
+                      "ids_risk": record["ids_risk"],
+                      "device_trust_synthetic": trust,
+                      "rl_action": ACTIONS[action],
+                      "final_action": ACTIONS[final],
+                      "reason": reason,
+                      "observation": observation.tolist(),
+                  }
+
+                  scenarios.append(result)
+
+                  print(
+                      model_name, scenario,
+                      "RISK:", record["ids_risk"],
+                      "RL:", ACTIONS[action],
+                      "FINAL:", ACTIONS[final],
+                      "REASON:", reason,
+                      flush=True
+                  )
+
+                  if scenario == "SAFE":
+                      assert final == 0, (
+                          "Unsupported safe-path action: "
+                          + ACTIONS[final]
+                      )
+                  else:
+                      assert final == 4
+                      assert reason == "MANDATORY_BLOCK"
+
+          output = {
+              "cell": "P5_C24B",
+              "stage": "INFERENCE",
+              "ids_checkpoint_sha256": actual_hash,
+              "cohort_size": len(records),
+              "input_kind": (
+                  "heldout_dataset_flows_with_"
+                  "synthetic_twin_context"
+              ),
+              "labels_used_as_model_inputs": False,
+              "scenarios": scenarios,
+          }
+
+          result_path = (
+              ROOT / "results/p5-c24b-inference.json"
+          )
+
+          result_path.write_text(
+              json.dumps(output, indent=2),
+              encoding="utf-8"
+          )
+
+          print(
+              "[PASS] IDS -> DQN/PPO -> Zero Trust",
+              flush=True
+          )
+          PY
+
+          python /tmp/p5_c24b_inference.py
+
+      - name: Create custom OS-Ken controller
+        run: |
+          cat > /tmp/p5_c24b_controller.py <<'PY'
+          import json
+          import os
+
+          from os_ken.base import app_manager
+          from os_ken.controller import ofp_event
+          from os_ken.controller.handler import (
+              CONFIG_DISPATCHER,
+              MAIN_DISPATCHER,
+              DEAD_DISPATCHER,
+              set_ev_cls,
+          )
+          from os_ken.lib import hub
+          from os_ken.ofproto import ofproto_v1_3
+
+          CMD = "/tmp/p5-c24b-command.json"
+          ACK = "/tmp/p5-c24b-ack.json"
+          COOKIE = 0x24B
+
+          class C24BController(app_manager.OSKenApp):
+              OFP_VERSIONS = [
+                  ofproto_v1_3.OFP_VERSION
+              ]
+
+              def __init__(self, *args, **kwargs):
+                  super().__init__(*args, **kwargs)
+                  self.datapaths = {}
+                  self.last_id = None
+                  self.worker = hub.spawn(
+                      self.process_commands
+                  )
+
+              @set_ev_cls(
+                  ofp_event.EventOFPSwitchFeatures,
+                  CONFIG_DISPATCHER
+              )
+              def switch_features(self, ev):
+                  dp = ev.msg.datapath
+                  self.datapaths[dp.id] = dp
+                  ofp = dp.ofproto
+                  parser = dp.ofproto_parser
+
+                  actions = [
+                      parser.OFPActionOutput(
+                          ofp.OFPP_CONTROLLER,
+                          ofp.OFPCML_NO_BUFFER
+                      )
+                  ]
+
+                  inst = [
+                      parser.OFPInstructionActions(
+                          ofp.OFPIT_APPLY_ACTIONS,
+                          actions
+                      )
+                  ]
+
+                  dp.send_msg(parser.OFPFlowMod(
+                      datapath=dp,
+                      priority=0,
+                      match=parser.OFPMatch(),
+                      instructions=inst
+                  ))
+
+                  self.logger.info(
+                      "P5_C24B SWITCH_CONNECTED dpid=%s",
+                      dp.id
+                  )
+
+              @set_ev_cls(
+                  ofp_event.EventOFPStateChange,
+                  DEAD_DISPATCHER
+              )
+              def disconnected(self, ev):
+                  self.datapaths.pop(
+                      ev.datapath.id, None
+                  )
+
+              @set_ev_cls(
+                  ofp_event.EventOFPPacketIn,
+                  MAIN_DISPATCHER
+              )
+              def packet_in(self, ev):
+                  msg = ev.msg
+                  dp = msg.datapath
+                  ofp = dp.ofproto
+                  parser = dp.ofproto_parser
+
+                  dp.send_msg(parser.OFPPacketOut(
+                      datapath=dp,
+                      buffer_id=ofp.OFP_NO_BUFFER,
+                      in_port=msg.match["in_port"],
+                      actions=[
+                          parser.OFPActionOutput(
+                              ofp.OFPP_FLOOD
+                          )
+                      ],
+                      data=msg.data
+                  ))
+
+              def process_commands(self):
+                  while True:
+                      try:
+                          if os.path.isfile(CMD):
+                              with open(CMD) as f:
+                                  req = json.load(f)
+
+                              rid = req["request_id"]
+
+                              if rid != self.last_id:
+                                  action = req["action"]
+                                  self.apply_policy(action)
+                                  self.last_id = rid
+
+                                  tmp = ACK + ".tmp"
+                                  with open(tmp, "w") as f:
+                                      json.dump({
+                                          "request_id": rid,
+                                          "action": action,
+                                          "status": "SENT"
+                                      }, f)
+
+                                  os.replace(tmp, ACK)
+
+                                  self.logger.info(
+                                      "P5_C24B POLICY %s %s",
+                                      action, rid
+                                  )
+
+                      except Exception:
+                          self.logger.exception(
+                              "P5_C24B command failure"
+                          )
+
+                      hub.sleep(0.1)
+
+              def apply_policy(self, action):
+                  if action not in ("ALLOW", "BLOCK"):
+                      raise ValueError(
+                          "Unsupported SDN action: "
+                          + str(action)
+                      )
+
+                  if 1 not in self.datapaths:
+                      raise RuntimeError(
+                          "Switch disconnected"
+                      )
+
+                  dp = self.datapaths[1]
+                  ofp = dp.ofproto
+                  parser = dp.ofproto_parser
+
+                  match = parser.OFPMatch(
+                      eth_type=0x0800,
+                      ipv4_src="10.0.0.1",
+                      ipv4_dst="10.0.0.2"
+                  )
+
+                  if action == "BLOCK":
+                      mod = parser.OFPFlowMod(
+                          datapath=dp,
+                          cookie=COOKIE,
+                          table_id=0,
+                          priority=200,
+                          match=match,
+                          instructions=[]
+                      )
+                  else:
+                      mod = parser.OFPFlowMod(
+                          datapath=dp,
+                          command=ofp.OFPFC_DELETE_STRICT,
+                          cookie=COOKIE,
+                          cookie_mask=0xffffffffffffffff,
+                          table_id=0,
+                          priority=200,
+                          match=match,
+                          out_port=ofp.OFPP_ANY,
+                          out_group=ofp.OFPG_ANY
+                      )
+
+                  dp.send_msg(mod)
+          PY
+
+      - name: Verify end-to-end OpenFlow enforcement
+        run: |
+          sudo /usr/bin/python3 - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import time
+          from pathlib import Path
+
+          from mininet.net import Mininet
+          from mininet.node import OVSSwitch, RemoteController
+          from mininet.log import setLogLevel
+
+          setLogLevel("warning")
+
+          ROOT = Path(os.environ["GITHUB_WORKSPACE"])
+          RESULT = ROOT / "results/p5-c24b-inference.json"
+
+          evidence = json.loads(RESULT.read_text())
+
+          CMD = Path("/tmp/p5-c24b-command.json")
+          ACK = Path("/tmp/p5-c24b-ack.json")
+          LOG = Path("/tmp/p5-c24b-controller.log")
+
+          process = None
+          net = None
+
+          def flows():
+              return subprocess.check_output(
+                  [
+                      "ovs-ofctl", "-O", "OpenFlow13",
+                      "dump-flows", "s1"
+                  ],
+                  text=True
+              )
+
+          def blocked():
+              return any(
+                  "priority=200" in line
+                  and "nw_src=10.0.0.1" in line
+                  and "nw_dst=10.0.0.2" in line
+                  and "actions=drop" in line
+                  for line in flows().splitlines()
+              )
+
+          def wait_for(label, predicate, timeout=30):
+              deadline = time.monotonic() + timeout
+
+              while time.monotonic() < deadline:
+                  if process.poll() is not None:
+                      raise RuntimeError(
+                          "Controller terminated: " + label
+                      )
+
+                  if predicate():
+                      print(
+                          "[PASS]", label,
+                          flush=True
+                      )
+                      return
+
+                  time.sleep(0.25)
+
+              raise AssertionError(
+                  "Timed out: " + label
+              )
+
+          def connected():
+              output = subprocess.check_output(
+                  [
+                      "ovs-vsctl",
+                      "--columns=is_connected",
+                      "list", "Controller"
+                  ],
+                  text=True
+              )
+
+              return bool(re.search(
+                  r"is_connected\s*:\s*true",
+                  output
+              ))
+
+          def apply(action, request_id):
+              assert action in ("ALLOW", "BLOCK")
+
+              ACK.unlink(missing_ok=True)
+
+              tmp = CMD.with_suffix(".tmp")
+              tmp.write_text(json.dumps({
+                  "action": action,
+                  "request_id": request_id
+              }))
+              os.replace(tmp, CMD)
+
+              def acknowledged():
+                  if not ACK.exists():
+                      return False
+
+                  reply = json.loads(
+                      ACK.read_text()
+                  )
+
+                  return (
+                      reply.get("request_id") == request_id
+                      and reply.get("action") == action
+                      and reply.get("status") == "SENT"
+                  )
+
+              wait_for(
+                  "Controller accepted " + request_id,
+                  acknowledged
+              )
+
+              wait_for(
+                  "OpenFlow policy " + action,
+                  blocked if action == "BLOCK"
+                  else lambda: not blocked()
+              )
+
+          def ping_loss(host):
+              output = host.cmd(
+                  "ping -n -c 3 -W 2 10.0.0.2"
+              )
+
+              print(output, flush=True)
+
+              match = re.search(
+                  r"(\d+(?:\.\d+)?)%\s+packet loss",
+                  output
+              )
+
+              assert match, "Unable to parse ping"
+              return float(match.group(1))
+
+          try:
+              CMD.unlink(missing_ok=True)
+              ACK.unlink(missing_ok=True)
+
+              with LOG.open("w") as logfile:
+                  process = subprocess.Popen(
+                      [
+                          "/tmp/p5-osken/bin/osken-manager",
+                          "--ofp-listen-host",
+                          "127.0.0.1",
+                          "--ofp-tcp-listen-port",
+                          "6653",
+                          "/tmp/p5_c24b_controller.py"
+                      ],
+                      stdout=logfile,
+                      stderr=subprocess.STDOUT,
+                      env={
+                          **os.environ,
+                          "PYTHONUNBUFFERED": "1"
+                      }
+                  )
+
+                  net = Mininet(
+                      controller=None,
+                      switch=OVSSwitch,
+                      autoSetMacs=True,
+                      build=False
+                  )
+
+                  net.addController(
+                      "c0",
+                      controller=RemoteController,
+                      ip="127.0.0.1",
+                      port=6653
+                  )
+
+                  h1 = net.addHost(
+                      "h1", ip="10.0.0.1/24"
+                  )
+                  h2 = net.addHost(
+                      "h2", ip="10.0.0.2/24"
+                  )
+
+                  s1 = net.addSwitch(
+                      "s1",
+                      protocols="OpenFlow13",
+                      failMode="secure",
+                      dpid="0000000000000001"
+                  )
+
+                  net.addLink(h1, s1)
+                  net.addLink(h2, s1)
+
+                  net.build()
+                  net.start()
+
+                  wait_for(
+                      "OVS controller connected",
+                      connected
+                  )
+
+                  wait_for(
+                      "OS-Ken switch handshake",
+                      lambda:
+                      "P5_C24B SWITCH_CONNECTED dpid=1"
+                      in LOG.read_text()
+                  )
+
+                  wait_for(
+                      "Table-miss flow installed",
+                      lambda:
+                      "actions=CONTROLLER" in flows()
+                  )
+
+                  network_results = []
+
+                  for model_name in ("DQN", "PPO"):
+                      for scenario in (
+                          "SAFE", "HIGH_RISK"
+                      ):
+                          matches = [
+                              item
+                              for item in evidence["scenarios"]
+                              if item["model"] == model_name
+                              and item["scenario"] == scenario
+                          ]
+
+                          assert len(matches) == 1
+                          record = matches[0]
+
+                          action = record["final_action"]
+
+                          print(
+                              "\nMODEL:", model_name,
+                              "SCENARIO:", scenario,
+                              "IDS RISK:", record["ids_risk"],
+                              "RL:", record["rl_action"],
+                              "FINAL:", action,
+                              "REASON:", record["reason"],
+                              flush=True
+                          )
+
+                          request_id = (
+                              model_name + "-" + scenario
+                          )
+
+                          apply(action, request_id)
+
+                          loss = ping_loss(h1)
+
+                          expected = (
+                              0.0 if action == "ALLOW"
+                              else 100.0
+                          )
+
+                          assert loss == expected, (
+                              f"Expected {expected}% "
+                              f"but observed {loss}%"
+                          )
+
+                          network_results.append({
+                              "model": model_name,
+                              "scenario": scenario,
+                              "final_action": action,
+                              "packet_loss": loss,
+                          })
+
+                          if action == "BLOCK":
+                              # Test cleanup, not RL inference.
+                              apply(
+                                  "ALLOW",
+                                  model_name
+                                  + "-administrative-reset"
+                              )
+
+                              assert ping_loss(h1) == 0.0
+
+                  controller_log = LOG.read_text()
+
+                  for name in ("DQN", "PPO"):
+                      for scenario in (
+                          "SAFE", "HIGH_RISK"
+                      ):
+                          assert (
+                              name + "-" + scenario
+                          ) in controller_log
+
+                  evidence["network_results"] = (
+                      network_results
+                  )
+
+                  evidence["stage"] = "END_TO_END_PASS"
+                  evidence["network_context"] = (
+                      "two_hosts_one_ovs_switch"
+                  )
+                  evidence["limitations"] = [
+                      "Dataset flows are not live Mininet captures",
+                      "Non-IDS twin context is synthetic",
+                      "Only ALLOW and BLOCK are enforced",
+                      "Packet loss is a functional test",
+                  ]
+
+                  final_path = (
+                      ROOT
+                      / "results/p5-c24b-final-evidence.json"
+                  )
+
+                  final_path.write_text(
+                      json.dumps(evidence, indent=2),
+                      encoding="utf-8"
+                  )
+
+                  print("\n" + "=" * 70)
+                  print("P5_C24B FINAL RESULTS")
+                  print("=" * 70)
+                  print("Real IDS inference     : PASS")
+                  print("DQN/PPO inference      : PASS")
+                  print("Zero-trust decisions   : PASS")
+                  print("OS-Ken controller      : PASS")
+                  print("OpenFlow 1.3           : PASS")
+                  print("Network enforcement    : PASS")
+                  print("Administrative recovery: PASS")
+                  print("Evidence saved         : PASS")
+                  print("P5_C24B                : PASS")
+                  print("=" * 70, flush=True)
+
+          finally:
+              if net is not None:
+                  net.stop()
+
+              if process is not None:
+                  process.terminate()
+                  try:
+                      process.wait(timeout=5)
+                  except subprocess.TimeoutExpired:
+                      process.kill()
+                      process.wait()
+          PY
+
+      - name: Upload integration evidence
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: p5-c24b-end-to-end-evidence
+          path: |
+            results/p5-c24b-inference.json
+            results/p5-c24b-final-evidence.json
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Show failure diagnostics
+        if: failure()
+        run: |
+          sudo tail -150 \
+            /tmp/p5-c24b-controller.log || true
+
+          sudo ovs-vsctl list Controller || true
+
+          sudo ovs-ofctl -O OpenFlow13 \
+            dump-flows s1 || true
+
+      - name: Clean up Mininet
+        if: always()
+        run: sudo mn -c || true
