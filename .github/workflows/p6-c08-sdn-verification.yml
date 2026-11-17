@@ -1,0 +1,123 @@
+name: P6 C08 SDN Enforcement Verification
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  phase6-sdn-verification:
+
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Record execution revision
+        run: |
+          mkdir -p results/p6_c08
+          git rev-parse HEAD > results/p6_c08/execution_commit.txt
+          git status --porcelain
+
+      - name: Verify frozen source and fixture hashes
+        run: |
+          sha256sum --check <<'HASHES'
+          b1f438d45aa956d719ed9759fa3e055f7ebec5e4a9cb19662bfe9c6639048956  source/p5_c25_five_action_controller.py
+          02da168c9b439c06ea79b8624c80d2ef4a7d4b2c3b3851eb3a2f39b070ca943d  source/p5_c25_five_action_test.py
+          8548c6e101328cff098068c9f56cbf71cd6ff3fc89409017af47b0187dd3c38e  source/p5_c26_integrated_dataplane_test.py
+          7148af2e693804236e41f73fbfcc5574a599e01acbc47bc23d7ff1f123537d48  fixtures/p6_sdn_enforcement_test_plan_v1.json
+          6bfb7c19e980ad456b8082d9ddd01f5afc209f139ac98879be0ed92e3379da57  source/p6_c08_integrated_dataplane_test.py
+          HASHES
+
+      - name: Install networking dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            mininet \
+            openvswitch-switch \
+            tcpdump \
+            iperf3 \
+            python3-venv
+
+          sudo systemctl start openvswitch-switch
+          sudo mn -c
+
+      - name: Install OS-Ken
+        run: |
+          /usr/bin/python3 -m venv /tmp/p6-c08-venv
+
+          /tmp/p6-c08-venv/bin/pip install \
+            "os-ken==3.1.1"
+
+      - name: Record runtime versions
+        run: |
+          {
+            uname -a
+            /usr/bin/python3 --version
+            ovs-vsctl --version
+            mn --version
+            iperf3 --version
+            tcpdump --version
+            /tmp/p6-c08-venv/bin/pip freeze
+          } > results/p6_c08/runtime_versions.txt 2>&1
+
+      - name: Start frozen five-action SDN controller
+        run: |
+          rm -f /tmp/p5-c25-command.json
+          rm -f /tmp/p5-c25-ack.json
+
+          nohup /tmp/p6-c08-venv/bin/osken-manager \
+            --ofp-tcp-listen-port 6653 \
+            source/p5_c25_five_action_controller.py \
+            > results/p6_c08/controller.log 2>&1 &
+
+          echo $! > /tmp/p6-c08-controller.pid
+
+          sleep 5
+
+          kill -0 "$(cat /tmp/p6-c08-controller.pid)"
+
+          cat results/p6_c08/controller.log
+
+      - name: Execute all 15 Phase-6 scenarios
+        run: |
+          set -o pipefail
+
+          sudo /usr/bin/python3 -u \
+            source/p6_c08_integrated_dataplane_test.py \
+            2>&1 | tee results/p6_c08/verification.log
+
+      - name: Collect diagnostic evidence
+        if: always()
+        run: |
+          mkdir -p results/p6_c08
+
+          sudo ovs-vsctl show \
+            > results/p6_c08/ovs_diagnostics.txt || true
+
+          cat results/p6_c08/controller.log || true
+
+          cat results/p6_c08/integrated_dataplane_summary.json || true
+
+          sudo chmod -R a+rX results/p6_c08
+
+      - name: Upload Phase-6 experimental evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: p6-c08-sdn-enforcement-evidence
+          path: results/p6_c08/
+          retention-days: 90
+
+      - name: Cleanup isolated network
+        if: always()
+        run: |
+          if [ -f /tmp/p6-c08-controller.pid ]; then
+            kill "$(cat /tmp/p6-c08-controller.pid)" || true
+          fi
+
+          sudo mn -c || true
