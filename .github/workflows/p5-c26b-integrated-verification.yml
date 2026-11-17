@@ -1,0 +1,140 @@
+
+name: P5 C26B Integrated AI SDN Verification
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  integrated-verification:
+
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install CPU PyTorch
+        run: |
+          python -m pip install --upgrade pip
+
+          python -m pip install torch \
+            --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install AI dependencies
+        run: |
+          python -m pip install \
+            "stable-baselines3==2.9.2" \
+            "scikit-learn==1.6.1" \
+            joblib
+
+      - name: Generate AI decision execution plan
+        run: |
+          mkdir -p results/p5_c26
+
+          set -o pipefail
+
+          python -u \
+            source/p5_c26_ai_decision_bridge.py \
+            2>&1 | tee results/p5_c26/inference.log
+
+      - name: Install networking dependencies
+        run: |
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            mininet \
+            openvswitch-switch \
+            tcpdump \
+            iperf3 \
+            python3-venv
+
+          sudo systemctl start openvswitch-switch
+
+          sudo mn -c
+
+      - name: Install OS-Ken
+        run: |
+          /usr/bin/python3 -m venv /tmp/p5-c26-venv
+
+          /tmp/p5-c26-venv/bin/pip install \
+            "os-ken==3.1.1"
+
+      - name: Start verified five-action controller
+        run: |
+          rm -f /tmp/p5-c25-command.json
+          rm -f /tmp/p5-c25-ack.json
+
+          nohup /tmp/p5-c26-venv/bin/osken-manager \
+            --ofp-tcp-listen-port 6653 \
+            source/p5_c25_five_action_controller.py \
+            > results/p5_c26/controller.log 2>&1 &
+
+          echo $! > /tmp/p5-c26-controller.pid
+
+          sleep 5
+
+          kill -0 "$(cat /tmp/p5-c26-controller.pid)"
+
+          cat results/p5_c26/controller.log
+
+      - name: Execute all 18 integrated scenarios
+        run: |
+          set -o pipefail
+
+          sudo /usr/bin/python3 -u \
+            source/p5_c26_integrated_dataplane_test.py \
+            2>&1 | tee results/p5_c26/integrated_verification.log
+
+      - name: Display integrated results
+        if: always()
+        run: |
+          mkdir -p results/p5_c26
+
+          cat results/p5_c26/controller.log || true
+
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          path = Path(
+              "results/p5_c26/"
+              "integrated_dataplane_summary.json"
+          )
+
+          if path.exists():
+
+              data = json.loads(path.read_text())
+
+              data.pop("scenarios", None)
+
+              print(json.dumps(data, indent=2))
+          PY
+
+          sudo chmod -R a+rX results/p5_c26
+
+      - name: Upload integrated experimental evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: p5-c26b-integrated-ai-sdn-evidence
+          path: results/p5_c26/
+          retention-days: 90
+
+      - name: Cleanup
+        if: always()
+        run: |
+          if [ -f /tmp/p5-c26-controller.pid ]; then
+            kill "$(cat /tmp/p5-c26-controller.pid)" || true
+          fi
+
+          sudo mn -c || true
