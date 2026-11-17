@@ -1,0 +1,101 @@
+
+name: P5 C25B Five Action Verification
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  five-action-verification:
+
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install networking dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            mininet \
+            openvswitch-switch \
+            tcpdump \
+            iperf3 \
+            python3-venv
+
+          sudo systemctl start openvswitch-switch
+
+          sudo mn -c
+
+          sudo ovs-vsctl --version
+
+      - name: Install OS-Ken
+        run: |
+          /usr/bin/python3 -m venv /tmp/p5-c25-venv
+
+          /tmp/p5-c25-venv/bin/pip install \
+            "os-ken==3.1.1"
+
+      - name: Start five-action SDN controller
+        run: |
+          mkdir -p results/p5_c25
+
+          rm -f /tmp/p5-c25-command.json
+          rm -f /tmp/p5-c25-ack.json
+
+          nohup /tmp/p5-c25-venv/bin/osken-manager \
+            --ofp-tcp-listen-port 6653 \
+            source/p5_c25_five_action_controller.py \
+            > results/p5_c25/controller.log 2>&1 &
+
+          echo $! > /tmp/p5-c25-controller.pid
+
+          sleep 5
+
+          kill -0 "$(cat /tmp/p5-c25-controller.pid)"
+
+          cat results/p5_c25/controller.log
+
+      - name: Verify all five dataplane actions
+        run: |
+          set -o pipefail
+
+          sudo /usr/bin/python3 -u \
+            source/p5_c25_five_action_test.py \
+            2>&1 | tee results/p5_c25/verification.log
+
+      - name: Collect diagnostic evidence
+        if: always()
+        run: |
+          mkdir -p results/p5_c25
+
+          sudo ovs-vsctl show \
+            > results/p5_c25/ovs_diagnostics.txt
+
+          cat results/p5_c25/controller.log || true
+
+          cat results/p5_c25/verification_results.json || true
+
+          sudo chmod -R a+rX results/p5_c25
+
+      - name: Upload experimental evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: p5-c25-five-action-evidence
+          path: results/p5_c25/
+          retention-days: 90
+
+      - name: Cleanup
+        if: always()
+        run: |
+          if [ -f /tmp/p5-c25-controller.pid ]; then
+            kill "$(cat /tmp/p5-c25-controller.pid)" || true
+          fi
+
+          sudo mn -c
